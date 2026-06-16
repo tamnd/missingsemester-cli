@@ -1,0 +1,10 @@
+title       = "missing"
+baseURL     = "https://missingsemester-cli.tamnd.com/"
+description = "Browse the Missing Semester of Your CS Education from the command line"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/missingsemester-cli"
