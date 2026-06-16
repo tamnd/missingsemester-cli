@@ -2,34 +2,21 @@ package missingsemester
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
+	"strconv"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes missingsemester as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/missingsemester-cli/missingsemester"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// missingsemester:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone missing binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// domain.go exposes missingsemester as a kit Domain.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the missingsemester driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the missingsemester driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "missingsemester",
@@ -37,10 +24,10 @@ func (Domain) Info() kit.DomainInfo {
 		Identity: kit.Identity{
 			Binary: "missing",
 			Short:  "Browse the Missing Semester of Your CS Education from the command line",
-			Long: `Browse the Missing Semester of Your CS Education from the command line
+			Long: `Browse the Missing Semester of Your CS Education from the command line.
 
-missing reads public missingsemester data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
+missing reads public data from missing.csail.mit.edu over plain HTTPS, shapes it
+into clean records, and prints output that pipes into the rest of your tools. No API
 key, nothing to run alongside it.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/missingsemester-cli",
@@ -48,28 +35,35 @@ key, nothing to run alongside it.`,
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `missing page` and
-	// `ant get missingsemester://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// list: lectures for a year
+	kit.Handle(app, kit.OpMeta{Name: "list", Group: "read", List: true,
+		Summary: "List lectures for a year (default: 2020)"}, listLectures)
 
-	// List op: members of a page, the home of `missing links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// missingsemester://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// lecture: one lecture detail
+	kit.Handle(app, kit.OpMeta{Name: "lecture", Group: "read", Single: true,
+		Summary: "Show one lecture's content",
+		Args: []kit.Arg{
+			{Name: "year", Help: "course year (2019, 2020, 2026)"},
+			{Name: "slug", Help: "lecture slug (e.g. editors)"},
+		}}, getLecture)
+
+	// years: available course years
+	kit.Handle(app, kit.OpMeta{Name: "years", Group: "read", List: true,
+		Summary: "List all available course years"}, listYears)
+
+	// export: JSONL of all lectures
+	kit.Handle(app, kit.OpMeta{Name: "export", Group: "read", List: true,
+		Summary: "Export lectures as JSONL"}, exportLectures)
+
+	// info: site stats
+	kit.Handle(app, kit.OpMeta{Name: "info", Group: "read", Single: true,
+		Summary: "Site stats"}, siteInfo)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -87,87 +81,151 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type listIn struct {
+	Year   int     `kit:"flag" default:"2020" help:"course year (2019, 2020, 2026)"`
+	Limit  int     `kit:"flag,inherit"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type lectureIn struct {
+	Year     string  `kit:"arg" help:"course year"`
+	Slug     string  `kit:"arg" help:"lecture slug"`
+	MaxChars int     `kit:"flag" default:"5000" help:"truncate body text"`
+	Client   *Client `kit:"inject"`
+}
+
+type yearsIn struct {
+	Limit  int     `kit:"flag,inherit"`
+	Client *Client `kit:"inject"`
+}
+
+type exportIn struct {
+	Year   int     `kit:"flag" default:"2020" help:"year to export (0 = all years)"`
+	Client *Client `kit:"inject"`
+}
+
+type infoIn struct {
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listLectures(ctx context.Context, in listIn, emit func(*Lecture) error) error {
+	lectures, err := in.Client.Lectures(ctx, in.Year)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i, l := range lectures {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(l); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func getLecture(ctx context.Context, in lectureIn, emit func(*LectureDetail) error) error {
+	year, err := strconv.Atoi(in.Year)
+	if err != nil {
+		return errs.Usage("year must be a number: %s", in.Year)
+	}
+	detail, err := in.Client.LectureDetail(ctx, year, in.Slug)
+	if err != nil {
+		return mapErr(err)
+	}
+	if in.MaxChars > 0 && len(detail.Text) > in.MaxChars {
+		detail.Text = detail.Text[:in.MaxChars]
+	}
+	return emit(detail)
+}
 
-// Classify turns any accepted input — a bare path or a full missingsemester.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+func listYears(ctx context.Context, in yearsIn, emit func(*Year) error) error {
+	years, err := in.Client.Years(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i, y := range years {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(y); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func exportLectures(ctx context.Context, in exportIn, emit func(*LectureDetail) error) error {
+	var yearNums []int
+	if in.Year == 0 {
+		years, err := in.Client.Years(ctx)
+		if err != nil {
+			return mapErr(err)
+		}
+		for _, y := range years {
+			yearNums = append(yearNums, y.Year)
+		}
+	} else {
+		yearNums = []int{in.Year}
+	}
+
+	for _, y := range yearNums {
+		lectures, err := in.Client.Lectures(ctx, y)
+		if err != nil {
+			return mapErr(err)
+		}
+		for _, l := range lectures {
+			detail, err := in.Client.LectureDetail(ctx, l.Year, l.Slug)
+			if err != nil {
+				return mapErr(err)
+			}
+			if err := emit(detail); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func siteInfo(ctx context.Context, in infoIn, emit func(*Info) error) error {
+	years, err := in.Client.Years(ctx)
+	if err != nil {
+		// Return static info if we can't fetch.
+		return emit(&Info{
+			Site:     "The Missing Semester of Your CS Education",
+			Host:     Host,
+			Years:    3,
+			Lectures: 28,
+			Source:   "MIT CSAIL",
+		})
+	}
+	total := 0
+	for _, y := range years {
+		total += y.Lectures
+	}
+	return emit(&Info{
+		Site:     "The Missing Semester of Your CS Education",
+		Host:     Host,
+		Years:    len(years),
+		Lectures: total,
+		Source:   "MIT CSAIL",
+	})
+}
+
+// --- Resolver (domain.go interface) ---
+
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized missingsemester reference: %q", input)
-	}
-	return "page", id, nil
+	return "", "", fmt.Errorf("missingsemester URIs not supported for pasted URLs")
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("missingsemester has no resource type %q", uriType)
-	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	return "", errs.Usage("missingsemester has no URI type %q", uriType)
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
 func mapErr(err error) error {
 	return err
 }
